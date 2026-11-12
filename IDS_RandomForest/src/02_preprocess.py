@@ -33,8 +33,8 @@ def preprocess():
     save_artifact(scaler, config.PREPROCESSOR_PATH)
     save_json(config.FEATURE_COLUMNS, config.FEATURE_COLUMNS_PATH)
     
-    print(f"✅ Đã lưu dữ liệu xử lý tại: {config.PROCESSED_DATA_PATH}")
-    print(f"✅ Đã lưu Preprocessor tại: {config.PREPROCESSOR_PATH}")
+    print(f" Đã lưu dữ liệu xử lý tại: {config.PROCESSED_DATA_PATH}")
+    print(f" Đã lưu Preprocessor tại: {config.PREPROCESSOR_PATH}")
 
 if __name__ == "__main__":
     preprocess()
