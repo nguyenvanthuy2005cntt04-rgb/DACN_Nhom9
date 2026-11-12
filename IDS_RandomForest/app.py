@@ -41,12 +41,13 @@ def load_assets():
 
 clf, scaler, features = load_assets()
 
-# --- CƠ CHẾ QUẢN LÝ NETWORK FLOW (BIDIRECTIONAL) ---
+
 @st.cache_resource
 def get_shared_state():
-    return queue.Queue(), threading.Event(), {} # Hàng đợi, Event dừng, Dictionary lưu Flow
+    # Hàng đợi, Event dừng, Dictionary lưu Flow, Khóa luồng (Lock)
+    return queue.Queue(), threading.Event(), {}, threading.Lock()
 
-packet_queue, stop_sniff_event, flow_sessions = get_shared_state()
+packet_queue, stop_sniff_event, flow_sessions, flow_lock = get_shared_state()
 
 if 'live_packets' not in st.session_state:
     st.session_state.live_packets = []
@@ -57,24 +58,27 @@ def process_live_packet(packet):
     """
     Xử lý Packet thành Bidirectional Flow và tính toán đặc trưng CICFlowMeter
     """
-    if IP in packet:
-        src_ip = packet[IP].src
-        dst_ip = packet[IP].dst
-        protocol = packet[IP].proto
-        pkt_len = len(packet)
-        pkt_time = float(packet.time) 
+    if IP not in packet:
+        return
         
-        sport = packet[TCP].sport if TCP in packet else (packet[UDP].sport if UDP in packet else 0)
-        dport = packet[TCP].dport if TCP in packet else (packet[UDP].dport if UDP in packet else 0)
-        
-        if sport == 0 and dport == 0:
-            return # Bỏ qua các giao thức không phải TCP/UDP (VD: ICMP, ARP)
+    src_ip = packet[IP].src
+    dst_ip = packet[IP].dst
+    protocol = packet[IP].proto
+    pkt_len = len(packet)
+    pkt_time = float(packet.time) 
+    
+    sport = packet[TCP].sport if TCP in packet else (packet[UDP].sport if UDP in packet else 0)
+    dport = packet[TCP].dport if TCP in packet else (packet[UDP].dport if UDP in packet else 0)
+    
+    if sport == 0 and dport == 0:
+        return # Bỏ qua các giao thức không phải TCP/UDP
 
-        # 1. CƠ CHẾ BIDIRECTIONAL FLOW
-        forward_key = f"{src_ip}-{dst_ip}-{sport}-{dport}-{protocol}"
-        backward_key = f"{dst_ip}-{src_ip}-{dport}-{sport}-{protocol}"
-        
-        # Xác định hướng của gói tin
+    # 1. CƠ CHẾ BIDIRECTIONAL FLOW
+    forward_key = f"{src_ip}-{dst_ip}-{sport}-{dport}-{protocol}"
+    backward_key = f"{dst_ip}-{src_ip}-{dport}-{sport}-{protocol}"
+    
+    # KHOÁ LUỒNG LẠI KHI CẬP NHẬT DICTIONARY (Chống Race Condition)
+    with flow_lock:
         if forward_key in flow_sessions:
             flow_key = forward_key
             direction = "fwd"
@@ -82,77 +86,86 @@ def process_live_packet(packet):
             flow_key = backward_key
             direction = "bwd"
         else:
-            # Khởi tạo luồng mới (Gói đầu tiên mặc định là Fwd)
+            # Khởi tạo luồng mới
             flow_key = forward_key
             direction = "fwd"
+            
             flow_sessions[flow_key] = {
-                'Source IP': src_ip,
-                'Destination IP': dst_ip,
-                'Destination Port': dport,
-                'start_time': pkt_time,
-                'last_time': pkt_time,
-                'Total Fwd Packets': 0,
-                'Total Backward Packets': 0, 
-                'Total Length of Fwd Packets': 0,
-                'Total Length of Bwd Packets': 0,
-                'Fwd Packet Length Max': 0,
-                'Fwd Packet Length Min': 999999, # Gán tạm để tìm Min
-                'Bwd Packet Length Max': 0,
-                'Bwd Packet Length Min': 999999
+                'Source IP': src_ip, 'Destination IP': dst_ip,
+                'Destination Port': dport, 'Protocol': protocol,
+                'start_time': pkt_time, 'last_time': pkt_time,
+                'Total Fwd Packets': 0, 'Total Backward Packets': 0, 
+                'Total Length of Fwd Packets': 0, 'Total Length of Bwd Packets': 0,
+                'Fwd Packet Length Max': 0, 'Fwd Packet Length Min': 999999,
+                'Bwd Packet Length Max': 0, 'Bwd Packet Length Min': 999999,
+                'FIN Flag Count': 0, 'SYN Flag Count': 0, 'RST Flag Count': 0,
+                'PSH Flag Count': 0, 'ACK Flag Count': 0, 'URG Flag Count': 0
             }
 
-        # 2. CẬP NHẬT ĐẶC TRƯNG TƯƠNG THÍCH CIC-IDS2017
         flow = flow_sessions[flow_key]
         flow['last_time'] = pkt_time
         
+        # Đếm cờ TCP (Top feature importance trong hệ thống IDS)
+        if TCP in packet:
+            flags = packet[TCP].flags
+            if 'F' in flags: flow['FIN Flag Count'] += 1
+            if 'S' in flags: flow['SYN Flag Count'] += 1
+            if 'R' in flags: flow['RST Flag Count'] += 1
+            if 'P' in flags: flow['PSH Flag Count'] += 1
+            if 'A' in flags: flow['ACK Flag Count'] += 1
+            if 'U' in flags: flow['URG Flag Count'] += 1
+        
+        # Cập nhật số liệu kích thước gói tin
         if direction == "fwd":
             flow['Total Fwd Packets'] += 1
             flow['Total Length of Fwd Packets'] += pkt_len
-            if pkt_len > flow['Fwd Packet Length Max']:
-                flow['Fwd Packet Length Max'] = pkt_len
-            if pkt_len < flow['Fwd Packet Length Min']:
-                flow['Fwd Packet Length Min'] = pkt_len
+            if pkt_len > flow['Fwd Packet Length Max']: flow['Fwd Packet Length Max'] = pkt_len
+            if pkt_len < flow['Fwd Packet Length Min']: flow['Fwd Packet Length Min'] = pkt_len
         else:
             flow['Total Backward Packets'] += 1
             flow['Total Length of Bwd Packets'] += pkt_len
-            if pkt_len > flow['Bwd Packet Length Max']:
-                flow['Bwd Packet Length Max'] = pkt_len
-            if pkt_len < flow['Bwd Packet Length Min']:
-                flow['Bwd Packet Length Min'] = pkt_len
+            if pkt_len > flow['Bwd Packet Length Max']: flow['Bwd Packet Length Max'] = pkt_len
+            if pkt_len < flow['Bwd Packet Length Min']: flow['Bwd Packet Length Min'] = pkt_len
 
 def start_sniffing():
     try:
-        flow_sessions.clear() # Xóa rác phiên bắt cũ
+        with flow_lock:
+            flow_sessions.clear() # Xóa rác phiên bắt cũ an toàn
+            
         sniff(
             prn=process_live_packet,
             stop_filter=lambda p: stop_sniff_event.is_set(),
             store=False
         )
         
-        # 3. CHỐT SỔ VÀ ĐẨY FLOW VÀO QUEUE KHI DỪNG BẮT
-        for key, flow in list(flow_sessions.items()):
-            # Sửa lại Min nếu luồng không có gói tin chiều đó
-            if flow['Fwd Packet Length Min'] == 999999: flow['Fwd Packet Length Min'] = 0
-            if flow['Bwd Packet Length Min'] == 999999: flow['Bwd Packet Length Min'] = 0
-            
-            # Tính Flow Duration sang chuẩn Microseconds
-            duration_sec = flow['last_time'] - flow['start_time']
-            flow['Flow Duration'] = duration_sec * 1_000_000 
-            
-            # Đảm bảo Duration > 0 để tránh lỗi chia cho 0
-            if flow['Flow Duration'] <= 0:
-                flow['Flow Duration'] = 1.0 
+        # 3. CHỐT SỔ VÀ ĐẨY FLOW VÀO QUEUE
+        with flow_lock:
+            for key, flow in list(flow_sessions.items()):
+                if flow['Fwd Packet Length Min'] == 999999: flow['Fwd Packet Length Min'] = 0
+                if flow['Bwd Packet Length Min'] == 999999: flow['Bwd Packet Length Min'] = 0
                 
-            packet_queue.put(flow)
-            
+                # KHẮC PHỤC LỖI 4: TÍNH TOÁN RATE VÀ MEAN ĐỂ MÔ HÌNH HỌC MÁY KHÔNG BỊ SAI LỆCH
+                duration_sec = flow['last_time'] - flow['start_time']
+                if duration_sec <= 0: duration_sec = 0.000001 # Tránh chia cho 0
+                
+                flow['Flow Duration'] = duration_sec * 1_000_000 # Chuẩn Microseconds
+                
+                flow['Flow Bytes/s'] = (flow['Total Length of Fwd Packets'] + flow['Total Length of Bwd Packets']) / duration_sec
+                flow['Flow Packets/s'] = (flow['Total Fwd Packets'] + flow['Total Backward Packets']) / duration_sec
+                
+                flow['Fwd Packet Length Mean'] = flow['Total Length of Fwd Packets'] / flow['Total Fwd Packets'] if flow['Total Fwd Packets'] > 0 else 0
+                flow['Bwd Packet Length Mean'] = flow['Total Length of Bwd Packets'] / flow['Total Backward Packets'] if flow['Total Backward Packets'] > 0 else 0
+                
+                packet_queue.put(flow)
+                
     except Exception as e:
         print(f"Lỗi Sniffing: {e}")
 
 
 # ================= GIAO DIỆN STREAMLIT =================
 
-with st.expander("📡 **KHỐI GIÁM SÁT TRAFFIC MẠNG THỰC TẾ (REAL-TIME INTERNET SNIFFING)**", expanded=True):
-    st.info("Nhấn 'Bắt đầu', mở trình duyệt web. Hệ thống sẽ gom nhóm các gói tin thành luồng (Bidirectional Flow) chuẩn CIC-IDS2017.")
+with st.expander("📡 **KHỐI GIÁM SÁT TRAFFIC MẠNG THỰC TẾ )**", expanded=True):
+    st.info("Hãy lướt web để tạo traffic!")
     
     col_btn1, col_btn2, col_btn3 = st.columns(3)
     
@@ -161,13 +174,12 @@ with st.expander("📡 **KHỐI GIÁM SÁT TRAFFIC MẠNG THỰC TẾ (REAL-TIME
         st.session_state.sniffing = True
         stop_sniff_event.clear()
         
-        # Xóa sạch queue cũ
-        while not packet_queue.empty():
+        while not packet_queue.empty(): 
             packet_queue.get()
             
         t = threading.Thread(target=start_sniffing, daemon=True)
         t.start()
-        st.success("🟢 Đang bắt và bóc tách luồng mạng thực tế... Hãy lướt web để tạo traffic!")
+        st.success("🟢 Đang chạy luồng ngầm an toàn ... Hãy lướt web để tạo traffic!")
 
     if col_btn2.button("⏹ Dừng & Xử lý ML"):
         st.session_state.sniffing = False
@@ -186,14 +198,16 @@ with st.expander("📡 **KHỐI GIÁM SÁT TRAFFIC MẠNG THỰC TẾ (REAL-TIME
             df_captured.to_csv(csv_path, index=False)
             
             # Khớp đặc trưng với Model, điền 0 cho cột thiếu
+            # Nhờ đã tự tính các cột quan trọng (Means/Rates/Flags) nên tỷ lệ nhiễu cực thấp
             X_live = df_captured.reindex(columns=features, fill_value=0)
             X_live_scaled = scaler.transform(X_live)
             X_scaled_df = pd.DataFrame(X_live_scaled, columns=features)
             
             preds = clf.predict(X_scaled_df)
-            probs = clf.predict_proba(X_scaled_df)[:, 1]
+            probs = clf.predict_proba(X_scaled_df)[:, 1] if hasattr(clf, "predict_proba") else [0.0]*len(preds)
             
-            df_captured['Prediction'] = ['ATTACK' if p == 1 else 'BENIGN' for p in preds]
+            
+            df_captured['Prediction'] = ['ATTACK' if str(p).upper() in ['1', 'ATTACK', 'ANOMALY'] else 'BENIGN' for p in preds]
             df_captured['Attack_Probability'] = probs
             
             # Tối ưu: Chỉ phân giải Domain cho luồng ATTACK
@@ -214,7 +228,9 @@ with st.expander("📡 **KHỐI GIÁM SÁT TRAFFIC MẠNG THỰC TẾ (REAL-TIME
             m3.metric("Phát hiện Tấn công (ATTACK)", attack_count, delta_color="inverse")
             
             st.write("### 📋 Bảng Phân Tích Chi Tiết IP, Tên miền & Kết Quả Từ Mô Hình ML")
-            st.dataframe(df_captured[['Source IP', 'Destination IP', 'Website / Domain', 'Destination Port', 'Flow Duration', 'Prediction', 'Attack_Probability']])
+            # Hiển thị các cột quan trọng nếu có
+            display_cols = [c for c in ['Source IP', 'Destination IP', 'Website / Domain', 'Destination Port', 'Flow Bytes/s', 'Prediction', 'Attack_Probability'] if c in df_captured.columns]
+            st.dataframe(df_captured[display_cols])
         else:
             st.warning("Chưa có luồng mạng nào! Hãy lướt web vài giây rồi thử lại.")
 
@@ -222,7 +238,7 @@ with st.expander("📡 **KHỐI GIÁM SÁT TRAFFIC MẠNG THỰC TẾ (REAL-TIME
         st.session_state.live_packets = []
         st.session_state.sniffing = False
         stop_sniff_event.set()
-        while not packet_queue.empty():
+        while not packet_queue.empty(): 
             packet_queue.get()
         st.rerun()
 
@@ -275,9 +291,10 @@ elif menu == "2. Phân tích File PCAP / CSV":
             X_scaled_df = pd.DataFrame(X_scaled, columns=features)
             
             preds = clf.predict(X_scaled_df)
-            probs = clf.predict_proba(X_scaled_df)[:, 1]
+            probs = clf.predict_proba(X_scaled_df)[:, 1] if hasattr(clf, "predict_proba") else [0.0]*len(preds)
             
-            df['Prediction'] = ['ATTACK' if p == 1 else 'BENIGN' for p in preds]
+            # Sửa lỗi ép kiểu nhãn ở chức năng Upload
+            df['Prediction'] = ['ATTACK' if str(p).upper() in ['1', 'ATTACK', 'ANOMALY'] else 'BENIGN' for p in preds]
             df['Attack_Probability'] = probs
             
             for idx, row in df[df['Prediction'] == 'ATTACK'].iterrows():
@@ -292,7 +309,6 @@ elif menu == "2. Phân tích File PCAP / CSV":
             k2.metric("An toàn (BENIGN)", normals)
             k3.metric("Phát hiện Tấn công (ATTACK)", attacks, delta_color="inverse")
             
-            # Render dataframe mà không bị lỗi thiếu cột
             display_cols = [c for c in ['Destination Port', 'Flow Duration', 'Prediction', 'Attack_Probability'] if c in df.columns]
             st.dataframe(df[display_cols])
 
